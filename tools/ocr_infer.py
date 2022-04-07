@@ -1,0 +1,167 @@
+import argparse
+
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+from line_profiler import LineProfiler
+from memory_profiler import profile
+from torchocr.utils.vis import draw_ocr_box_txt
+
+from tools.det_infer import DetInfer
+from tools.rec_infer import RecInfer
+
+
+def get_rotate_crop_image(img, points):
+    """
+    img_height, img_width = img.shape[0:2]
+    left = int(np.min(points[:, 0]))
+    right = int(np.max(points[:, 0]))
+    top = int(np.min(points[:, 1]))
+    bottom = int(np.max(points[:, 1]))
+    img_crop = img[top:bottom, left:right, :].copy()
+    points[:, 0] = points[:, 0] - left
+    points[:, 1] = points[:, 1] - top
+    """
+    points = points.astype(np.float32)
+    img_crop_width = int(
+        max(
+            np.linalg.norm(points[0] - points[1]), np.linalg.norm(points[2] - points[3])
+        )
+    )
+    img_crop_height = int(
+        max(
+            np.linalg.norm(points[0] - points[3]), np.linalg.norm(points[1] - points[2])
+        )
+    )
+    pts_std = np.float32(
+        [
+            [0, 0],
+            [img_crop_width, 0],
+            [img_crop_width, img_crop_height],
+            [0, img_crop_height],
+        ]
+    )
+    M = cv2.getPerspectiveTransform(points, pts_std)
+    dst_img = cv2.warpPerspective(
+        img,
+        M,
+        (img_crop_width, img_crop_height),
+        borderMode=cv2.BORDER_REPLICATE,
+        flags=cv2.INTER_CUBIC,
+    )
+    dst_img_height, dst_img_width = dst_img.shape[0:2]
+    if dst_img_height * 1.0 / dst_img_width >= 1.5:
+        dst_img = np.rot90(dst_img)
+    return dst_img
+
+
+# @torch.jit.script
+class OCRInfer(nn.Module):
+    def __init__(
+        self,
+        det_path,
+        rec_path,
+        rec_batch_size=16,
+        # time_profile=False,
+        # mem_profile=False,
+    ):
+        super().__init__()
+        # self.det_model = torch.jit.script(DetInfer(det_path))
+        # self.rec_model = torch.jit.script(RecInfer(rec_path, rec_batch_size))
+        self.det_model = DetInfer(det_path)
+        self.rec_model = RecInfer(rec_path, rec_batch_size)
+        # assert not (
+        #     time_profile and mem_profile
+        # ), "can not profile memory and time at the same time"
+        # self.line_profiler = None
+        # if time_profile:
+        #     self.line_profiler = LineProfiler()
+        #     self.predict = self.predict_time_profile
+        # if mem_profile:
+        #     self.predict = self.predict_mem_profile
+
+    def do_predict(self, img):
+        box_list, score_list = self.det_model.predict(img)
+        if len(box_list) == 0:
+            return [], [], img
+        draw_box_list = [tuple(map(tuple, box)) for box in box_list]
+        imgs = [get_rotate_crop_image(img, box) for box in box_list]
+        texts = self.rec_model.predict(imgs)
+        texts = [txt[0][0] for txt in texts]
+        debug_img = draw_ocr_box_txt(img, draw_box_list, texts)
+        return texts, score_list, debug_img
+
+    def forward(self, img):
+        return self.do_predict(img)
+
+    # def predict_mem_profile(self, img):
+    #     wapper = profile(self.do_predict)
+    #     return wapper(img)
+
+    # def predict_time_profile(self, img):
+    #     # run multi time
+    #     for i in range(8):
+    #         print("*********** {} profile time *************".format(i))
+    #         lp = LineProfiler()
+    #         lp_wrapper = lp(self.do_predict)
+    #         ret = lp_wrapper(img)
+    #         lp.print_stats()
+    #     return ret
+
+
+def init_args():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="OCR infer")
+    parser.add_argument(
+        "--det_path",
+        type=str,
+        help="det model path",
+        default="models/det_db_mbv3_new.pth",
+    )
+    parser.add_argument(
+        "--rec_path",
+        type=str,
+        help="rec model path",
+        default="models/ch_rec_moblie_crnn_mbv3.pth",
+    )
+    parser.add_argument(
+        "--img_path",
+        type=str,
+        help="img path for predict",
+        default="data/ic2.jpg",
+    )
+    parser.add_argument("--rec_batch_size", type=int, help="rec batch_size", default=16)
+    parser.add_argument(
+        "-time_profile", action="store_true", help="enable time profile mode"
+    )
+    parser.add_argument(
+        "-mem_profile", action="store_true", help="enable memory profile mode"
+    )
+    args,_ = parser.parse_known_args()
+
+    return vars(args)
+
+
+def post_process(debug_img):
+    (
+        h,
+        w,
+        _
+    ) = debug_img.shape
+    raido = 600.0 / w if w > 1200 else 1
+    debug_img = cv2.resize(debug_img, (int(w * raido), int(h * raido)))
+    return debug_img
+
+if __name__ == "__main__":
+    import cv2
+
+    args = init_args()
+    img = cv2.imread(args["img_path"])
+    model = OCRInfer(**args)
+    txts, boxes, debug_img = model.predict(img)
+    debug_img = post_process(debug_img)
+    if not (args["mem_profile"] or args["time_profile"]):
+        cv2.imshow("debug", debug_img)
+        cv2.waitKey()
